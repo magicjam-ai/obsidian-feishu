@@ -48,6 +48,7 @@ export class SyncEngine {
   }
 
   private cancelled = false;
+  private syncing = false;
 
   cancel(): void {
     this.cancelled = true;
@@ -70,45 +71,60 @@ export class SyncEngine {
 
     let success = 0;
     let failed = 0;
-    this.cancelled = false;
-    this.plugin.setStatus(`Feishu Sync: 0/${deduped.length}`);
-    new Notice(`飞书同步开始 (${deduped.length} 个文件)`);
+    if (this.syncing) {
+      new Notice("同步已在进行中，请稍候...");
+      return { success: 0, failed: 0 };
+    }
+    this.syncing = true;
 
-    for (const [index, file] of deduped.entries()) {
-      if (this.cancelled) {
-        new Notice(`已取消同步 (${index}/${deduped.length})`, 4000);
-        break;
+    try {
+      this.cancelled = false;
+      this.plugin.setStatus(`Feishu Sync: 0/${deduped.length}`);
+      new Notice(`飞书同步开始 (${deduped.length} 个文件)`);
+
+      for (const [index, file] of deduped.entries()) {
+        if (this.cancelled) {
+          new Notice(`已取消同步 (${index}/${deduped.length})`, 4000);
+          break;
+        }
+        this.plugin.setStatus(`Feishu Sync: ${index + 1}/${deduped.length} ✓${success} ✗${failed}`);
+        onProgress?.({
+          current: index,
+          total: deduped.length,
+          currentFile: file.name,
+          success,
+          failed,
+        });
+        try {
+          await this.syncSingleFile(file, client);
+          success += 1;
+        } catch (error) {
+          failed += 1;
+          console.error("[obsidian-feishu] sync failed", file.path, error);
+          new Notice(`失败: ${file.name} — ${error instanceof Error ? error.message : String(error)}`, 4000);
+        }
+
+        // Yield to main thread every 5 files to keep UI responsive
+        if ((index + 1) % 5 === 0) {
+          await new Promise<void>((r) => setTimeout(r, 0));
+        }
       }
-      this.plugin.setStatus(`Feishu Sync: ${index + 1}/${deduped.length}`);
+
+      await this.saveDataFile();
       onProgress?.({
-        current: index,
+        current: deduped.length,
         total: deduped.length,
-        currentFile: file.name,
+        currentFile: "",
         success,
         failed,
       });
-      try {
-        await this.syncSingleFile(file, client);
-        success += 1;
-      } catch (error) {
-        failed += 1;
-        console.error("[obsidian-feishu] sync failed", file.path, error);
-        new Notice(`失败: ${file.name} — ${error instanceof Error ? error.message : String(error)}`, 4000);
-      }
+      const summary = `飞书同步完成: ${success} 成功, ${failed} 失败`;
+      this.plugin.setStatus(summary);
+      new Notice(summary, 6000);
+      return { success, failed };
+    } finally {
+      this.syncing = false;
     }
-
-    await this.saveDataFile();
-    onProgress?.({
-      current: deduped.length,
-      total: deduped.length,
-      currentFile: "",
-      success,
-      failed,
-    });
-    const summary = `飞书同步完成: ${success} 成功, ${failed} 失败`;
-    this.plugin.setStatus(summary);
-    new Notice(summary, 6000);
-    return { success, failed };
   }
 
   private async syncSingleFile(file: TFile, client: FeishuClient): Promise<void> {
