@@ -2,6 +2,8 @@ import { Notice, TFile, normalizePath } from "obsidian";
 import type FeishuSyncPlugin from "./main";
 import { FeishuClient } from "./feishu-client";
 import { MarkdownParser, type ParsedBlock } from "./markdown-parser";
+import type { SyncProgress } from "./progress-modal";
+
 
 export interface SyncMappingData {
   files: Record<string, string>;
@@ -13,39 +15,49 @@ export class SyncEngine {
 
   constructor(private readonly plugin: FeishuSyncPlugin) {}
 
-  async syncCurrentFile(): Promise<void> {
-    const file = this.plugin.app.workspace.getActiveFile();
-    if (!file) {
-      new Notice("No active markdown file.");
-      return;
-    }
-    await this.syncFiles([file]);
+  async saveDataFile(): Promise<void> {
+    await this.plugin.savePluginData();
   }
 
-  async syncCurrentFolder(): Promise<void> {
+  async syncCurrentFile(onProgress?: (p: SyncProgress) => void): Promise<{ success: number; failed: number }> {
     const file = this.plugin.app.workspace.getActiveFile();
     if (!file) {
       new Notice("No active markdown file.");
-      return;
+      return { success: 0, failed: 0 };
+    }
+    return this.syncFiles([file], onProgress);
+  }
+
+  async syncCurrentFolder(onProgress?: (p: SyncProgress) => void): Promise<{ success: number; failed: number }> {
+    const file = this.plugin.app.workspace.getActiveFile();
+    if (!file) {
+      new Notice("No active markdown file.");
+      return { success: 0, failed: 0 };
     }
     const prefix = parentPath(file.path);
     const files = this.plugin.app.vault.getMarkdownFiles().filter((item) => parentPath(item.path) === prefix);
-    await this.syncFiles(files);
+    return this.syncFiles(files, onProgress);
   }
 
-  async syncConfiguredFolders(): Promise<void> {
+  async syncConfiguredFolders(onProgress?: (p: SyncProgress) => void): Promise<{ success: number; failed: number }> {
     const configured = parseSyncFolders(this.plugin.settings.syncFolders);
     const files = this.plugin.app.vault
       .getMarkdownFiles()
       .filter((file) => configured.length === 0 || configured.some((folder) => file.path === folder || file.path.startsWith(`${folder}/`)));
-    await this.syncFiles(files);
+    return this.syncFiles(files, onProgress);
   }
 
-  async syncFiles(files: TFile[]): Promise<void> {
+  private cancelled = false;
+
+  cancel(): void {
+    this.cancelled = true;
+  }
+
+  async syncFiles(files: TFile[], onProgress?: (p: SyncProgress) => void): Promise<{ success: number; failed: number }> {
     const deduped = Array.from(new Map(files.map((file) => [file.path, file])).values());
     if (deduped.length === 0) {
       new Notice("No markdown files matched the sync scope.");
-      return;
+      return { success: 0, failed: 0 };
     }
 
     const client = new FeishuClient({
@@ -58,26 +70,45 @@ export class SyncEngine {
 
     let success = 0;
     let failed = 0;
+    this.cancelled = false;
     this.plugin.setStatus(`Feishu Sync: 0/${deduped.length}`);
-    new Notice(`Feishu Sync: started (${deduped.length} files)`);
+    new Notice(`飞书同步开始 (${deduped.length} 个文件)`);
 
     for (const [index, file] of deduped.entries()) {
+      if (this.cancelled) {
+        new Notice(`已取消同步 (${index}/${deduped.length})`, 4000);
+        break;
+      }
       this.plugin.setStatus(`Feishu Sync: ${index + 1}/${deduped.length}`);
-      new Notice(`Syncing ${file.path} (${index + 1}/${deduped.length})`, 2000);
+      onProgress?.({
+        current: index,
+        total: deduped.length,
+        currentFile: file.name,
+        success,
+        failed,
+      });
       try {
         await this.syncSingleFile(file, client);
         success += 1;
       } catch (error) {
         failed += 1;
         console.error("[obsidian-feishu] sync failed", file.path, error);
-        new Notice(`Failed: ${file.path} — ${error instanceof Error ? error.message : String(error)}`, 6000);
+        new Notice(`失败: ${file.name} — ${error instanceof Error ? error.message : String(error)}`, 4000);
       }
     }
 
-    await this.plugin.savePluginData();
-    const summary = `Feishu Sync: done (${success} ok, ${failed} failed)`;
+    await this.saveDataFile();
+    onProgress?.({
+      current: deduped.length,
+      total: deduped.length,
+      currentFile: "",
+      success,
+      failed,
+    });
+    const summary = `飞书同步完成: ${success} 成功, ${failed} 失败`;
     this.plugin.setStatus(summary);
     new Notice(summary, 6000);
+    return { success, failed };
   }
 
   private async syncSingleFile(file: TFile, client: FeishuClient): Promise<void> {
@@ -102,7 +133,7 @@ export class SyncEngine {
       documentId = await client.createDocument(file.basename, folderToken);
       this.plugin.mapping.files[file.path] = documentId;
       created = true;
-      await this.plugin.savePluginData();
+      await this.saveDataFile();
     }
 
     const payload = await this.materializeBlocks(file, parsedBlocks, client);
@@ -120,6 +151,28 @@ export class SyncEngine {
       await client.setPermission(documentId);
     } catch (error) {
       console.warn("[obsidian-feishu] set permission failed", documentId, error);
+    }
+
+    // Add feishu link to frontmatter if not already present
+    await this.addFeishuLinkToFrontmatter(file, documentId);
+  }
+
+  private async addFeishuLinkToFrontmatter(file: TFile, documentId: string): Promise<void> {
+    try {
+      const content = await this.plugin.app.vault.cachedRead(file);
+      // Check if frontmatter already has a feishu link
+      const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+      if (fmMatch && fmMatch[1] && /^feishu:/m.test(fmMatch[1])) {
+        return;
+      }
+      const url = `https://nio.feishu.cn/docx/${documentId}`;
+      await this.plugin.app.fileManager.processFrontMatter(file, (fm) => {
+        if (!fm.feishu) {
+          fm.feishu = url;
+        }
+      });
+    } catch (error) {
+      console.warn("[obsidian-feishu] add feishu link to frontmatter failed", file.path, error);
     }
   }
 
@@ -177,7 +230,7 @@ export class SyncEngine {
         currentToken = await client.createFolder(segment, currentToken);
       }
       this.plugin.mapping.folders[currentPath] = currentToken;
-      await this.plugin.savePluginData();
+      await this.saveDataFile();
     }
 
     return currentToken;

@@ -75,7 +75,7 @@ export default class FeishuSyncPlugin extends Plugin {
     };
   }
 
-  private async runSync(task: () => Promise<void>): Promise<void> {
+  private async runSync(task: () => Promise<{ success: number; failed: number }>): Promise<void> {
     try {
       await task();
     } catch (error) {
