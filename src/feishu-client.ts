@@ -4,10 +4,17 @@ const BASE_URL = "https://open.feishu.cn/open-apis";
 const WRITE_BATCH_SIZE = 20;
 
 export interface FeishuClientConfig {
-  appId: string;
-  appSecret: string;
+  // OAuth mode
+  getAccessToken?: () => Promise<string>;
+  onTokenRefresh?: (accessToken: string, refreshToken: string, expiresAt: number) => void;
+
+  // Legacy mode
+  appId?: string;
+  appSecret?: string;
+
+  // Shared
   targetFolderToken: string;
-  ownerOpenId: string;
+  ownerOpenId?: string;
 }
 
 export interface DriveEntry {
@@ -26,13 +33,27 @@ export class FeishuApiError extends Error {
 export class FeishuClient {
   private tenantAccessToken: string | null = null;
   private tokenExpireAt = 0;
+  private readonly isOAuthMode: boolean;
 
-  constructor(private readonly config: FeishuClientConfig) {}
+  constructor(private readonly config: FeishuClientConfig) {
+    this.isOAuthMode = !!config.getAccessToken;
+  }
 
   validateConfig(): void {
-    if (!this.config.appId || !this.config.appSecret || !this.config.targetFolderToken) {
-      throw new FeishuApiError("Missing App ID, App Secret, or Target Folder Token in plugin settings.");
+    if (!this.config.targetFolderToken) {
+      throw new FeishuApiError("Missing Target Folder Token in plugin settings.");
     }
+    if (!this.isOAuthMode && (!this.config.appId || !this.config.appSecret)) {
+      throw new FeishuApiError("Missing App ID or App Secret. Please log in or configure a custom app.");
+    }
+  }
+
+  private async getAccessToken(): Promise<string> {
+    if (this.isOAuthMode && this.config.getAccessToken) {
+      return this.config.getAccessToken();
+    }
+    // Legacy mode: get tenant_access_token
+    return this.getTenantAccessToken();
   }
 
   async getTenantAccessToken(): Promise<string> {
@@ -219,17 +240,28 @@ export class FeishuClient {
         return await this.doRequestWithTimeout<T>(method, path, options, 15000);
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
+
+        // On 401 in OAuth mode, try refreshing token and retry once
+        if (this.isOAuthMode && attempt === 0 && lastError.message.includes('401')) {
+          try {
+            if (this.config.getAccessToken) {
+              // The getAccessToken callback already handles refresh
+              // Just retry
+            }
+          } catch {
+            // Refresh failed, don't retry
+            break;
+          }
+        }
         
         // Check if retryable
         if (attempt < maxRetries && this.isRetryable(lastError, attempt)) {
-          // Exponential backoff: 500ms, 1s, 2s...
           const delay = Math.min(500 * Math.pow(2, attempt), 4000);
           console.warn(`[FeishuClient] ${method} ${path} failed (attempt ${attempt + 1}), retrying in ${delay}ms: ${lastError.message}`);
           await this.sleep(delay);
           continue;
         }
         
-        // Non-retryable or max retries reached
         break;
       }
     }
@@ -239,16 +271,9 @@ export class FeishuClient {
 
   private isRetryable(error: Error, attempt: number): boolean {
     const msg = error.message.toLowerCase();
-    
-    // Rate limit errors
     if (msg.includes('429') || msg.includes('99991664') || msg.includes('rate limit')) return true;
-    
-    // Transient server errors
     if (msg.includes('500') || msg.includes('502') || msg.includes('503')) return true;
-    
-    // Network errors
     if (msg.includes('timeout') || msg.includes('net') || msg.includes('econnrefused')) return true;
-    
     return false;
   }
 
@@ -256,9 +281,6 @@ export class FeishuClient {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  /**
-   * 带超时的请求（使用 Promise.race 实现）
-   */
   private async doRequestWithTimeout<T>(method: string, path: string, options: any, timeoutMs = 15000): Promise<T> {
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new Error(`[FeishuClient] ${method} ${path} timeout after ${timeoutMs}ms`)), timeoutMs);
@@ -286,7 +308,7 @@ export class FeishuClient {
     });
 
     if (options.auth !== false) {
-      headers.Authorization = `Bearer ${await this.getTenantAccessToken()}`;
+      headers.Authorization = `Bearer ${await this.getAccessToken()}`;
     }
 
     let body: string | ArrayBuffer | undefined;

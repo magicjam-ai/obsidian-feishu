@@ -26,6 +26,26 @@ export class SyncEngine {
 
   constructor(private readonly plugin: FeishuSyncPlugin) {}
 
+  private createClient(): FeishuClient {
+    const settings = this.plugin.settings;
+    if (settings.useCustomApp) {
+      // Legacy mode
+      return new FeishuClient({
+        appId: settings.appId,
+        appSecret: settings.appSecret,
+        targetFolderToken: settings.targetFolderToken,
+        ownerOpenId: settings.ownerOpenId,
+      });
+    }
+    // OAuth mode
+    const oauth = this.plugin.getOAuthManager();
+    return new FeishuClient({
+      getAccessToken: () => oauth.getValidToken(),
+      targetFolderToken: settings.targetFolderToken,
+      ownerOpenId: settings.ownerOpenId,
+    });
+  }
+
   async saveDataFile(): Promise<void> {
     await this.plugin.savePluginData();
   }
@@ -96,12 +116,7 @@ export class SyncEngine {
       return { success: 0, failed: 0 };
     }
 
-    const client = new FeishuClient({
-      appId: this.plugin.settings.appId,
-      appSecret: this.plugin.settings.appSecret,
-      targetFolderToken: this.plugin.settings.targetFolderToken,
-      ownerOpenId: this.plugin.settings.ownerOpenId,
-    });
+    const client = this.createClient();
     client.validateConfig();
 
     let success = 0;
