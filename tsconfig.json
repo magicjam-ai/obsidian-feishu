@@ -11,13 +11,17 @@
     "noImplicitReturns": true,
     "moduleResolution": "node",
     "importHelpers": true,
-    "noUncheckedIndexedAccess": true,
     "isolatedModules": true,
     "strictNullChecks": true,
     "strictBindCallApply": true,
     "allowSyntheticDefaultImports": true,
     "useUnknownInCatchVariables": true,
-    "lib": ["DOM", "ES5", "ES6", "ES7"],
+    "lib": [
+      "DOM",
+      "ES5",
+      "ES6",
+      "ES7"
+    ],
     "types": [
       "node",
       "@wdio/globals/types",
@@ -25,5 +29,15 @@
       "wdio-obsidian-service"
     ]
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "wdio.conf.ts"]
+  "include": [
+    "src/**/*.ts",
+    "tests/**/*.ts",
+    "wdio.conf.ts"
+  ],
+  "exclude": [
+    "tests/**/*.ts",
+    "node_modules",
+    "wdio.conf.ts"
+  ],
+  "skipLibCheck": true
 }

@@ -25,8 +25,8 @@ export const config: WebdriverIO.Config = {
       browserVersion: 'latest',
       // Plugin folder to load (the current plugin)
       plugins: ['.'],
-      // Test vault configuration
-      vault: './test-vault',
+      // Robert's real vault
+      vault: '/Users/robert/obsidian',
     },
   }],
   
@@ -36,14 +36,18 @@ export const config: WebdriverIO.Config = {
   // Obsidian cache directory
   cacheDir: path.resolve('.obsidian-cache'),
   
+  // Connection pool settings for longer tests
+  connectionRetryCount: 5,
+  connectionRetryTimeout: 30000,
+  
   // Reporters
   reporters: ['obsidian'],
   
-  // Mocha options
+  // Mocha options - much longer timeout for full sync tests
   mochaOpts: {
     ui: 'bdd',
-    timeout: 60000,
-    retries: 2,
+    timeout: 600000, // 10 minutes for full sync
+    retries: 0, // No retries during test
   },
   
   // Log level

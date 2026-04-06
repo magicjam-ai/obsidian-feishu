@@ -211,6 +211,73 @@ export class FeishuClient {
       contentType?: string;
     } = {},
   ): Promise<T> {
+    const maxRetries = 3;
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await this.doRequestWithTimeout<T>(method, path, options, 15000);
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error));
+        
+        // Check if retryable
+        if (attempt < maxRetries && this.isRetryable(lastError, attempt)) {
+          // Exponential backoff: 500ms, 1s, 2s...
+          const delay = Math.min(500 * Math.pow(2, attempt), 4000);
+          console.warn(`[FeishuClient] ${method} ${path} failed (attempt ${attempt + 1}), retrying in ${delay}ms: ${lastError.message}`);
+          await this.sleep(delay);
+          continue;
+        }
+        
+        // Non-retryable or max retries reached
+        break;
+      }
+    }
+
+    throw lastError ?? new Error(`Request failed after ${maxRetries + 1} attempts`);
+  }
+
+  private isRetryable(error: Error, attempt: number): boolean {
+    const msg = error.message.toLowerCase();
+    
+    // Rate limit errors
+    if (msg.includes('429') || msg.includes('99991664') || msg.includes('rate limit')) return true;
+    
+    // Transient server errors
+    if (msg.includes('500') || msg.includes('502') || msg.includes('503')) return true;
+    
+    // Network errors
+    if (msg.includes('timeout') || msg.includes('net') || msg.includes('econnrefused')) return true;
+    
+    return false;
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  /**
+   * 带超时的请求（使用 Promise.race 实现）
+   */
+  private async doRequestWithTimeout<T>(method: string, path: string, options: any, timeoutMs = 15000): Promise<T> {
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error(`[FeishuClient] ${method} ${path} timeout after ${timeoutMs}ms`)), timeoutMs);
+    });
+    const requestPromise = this.doRequest<T>(method, path, options);
+    return Promise.race([requestPromise, timeoutPromise]) as Promise<T>;
+  }
+
+  private async doRequest<T>(
+    method: string,
+    path: string,
+    options: {
+      auth?: boolean;
+      body?: unknown;
+      rawBody?: ArrayBuffer;
+      query?: Record<string, string | number | boolean | undefined>;
+      contentType?: string;
+    },
+  ): Promise<T> {
     const headers: Record<string, string> = {};
     const url = new URL(`${BASE_URL}${path}`);
 
@@ -239,7 +306,6 @@ export class FeishuClient {
       headers,
       body,
       throw: false,
-      contentType: options.contentType,
     });
 
     let json: any = {};

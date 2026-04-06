@@ -9,7 +9,7 @@ interface PluginDataShape {
 
 export default class FeishuSyncPlugin extends Plugin {
   settings: FeishuSyncSettings = { ...DEFAULT_SETTINGS };
-  mapping: SyncMappingData = { files: {}, folders: {}, failedFiles: [] };
+  mapping: SyncMappingData = { files: {}, folders: {}, failedFiles: [], fileMtimes: {} };
   private statusBarEl!: HTMLElement;
   private syncEngine!: SyncEngine;
 
@@ -32,6 +32,12 @@ export default class FeishuSyncPlugin extends Plugin {
       id: "sync-all-configured-folders",
       name: "Feishu: Sync all configured folders",
       callback: async () => this.runSync(() => this.syncEngine.syncConfiguredFolders()),
+    });
+
+    this.addCommand({
+      id: "sync-all-configured-folders-full",
+      name: "Feishu: Sync all configured folders (full)",
+      callback: async () => this.runSync(() => this.syncEngine.syncConfiguredFoldersFull()),
     });
 
     this.addCommand({
@@ -86,6 +92,7 @@ export default class FeishuSyncPlugin extends Plugin {
       files: { ...(data?.mappings?.files ?? {}) },
       folders: { ...(data?.mappings?.folders ?? {}) },
       failedFiles: [...(data?.mappings?.failedFiles ?? [])],
+      fileMtimes: { ...(data?.mappings?.fileMtimes ?? {}) },
     };
   }
 

@@ -1,8 +1,16 @@
 import { Notice, TFile, normalizePath } from "obsidian";
+// SyncProgress interface (moved from progress-modal.ts)
+export interface SyncProgress {
+  current: number;
+  total: number;
+  currentFile: string;
+  success: number;
+  failed: number;
+}
+
 import type FeishuSyncPlugin from "./main";
 import { FeishuClient } from "./feishu-client";
 import { MarkdownParser, type ParsedBlock } from "./markdown-parser";
-import type { SyncProgress } from "./progress-modal";
 
 
 
@@ -10,6 +18,7 @@ export interface SyncMappingData {
   files: Record<string, string>;
   folders: Record<string, string>;
   failedFiles: string[]; // 同步失败的文件路径列表，支持增量重试
+  fileMtimes: Record<string, number>; // 记录每个文件同步时的 mtime，用于增量同步
 }
 
 export class SyncEngine {
@@ -41,12 +50,19 @@ export class SyncEngine {
     return this.syncFiles(files, onProgress);
   }
 
-  async syncConfiguredFolders(onProgress?: (p: SyncProgress) => void): Promise<{ success: number; failed: number }> {
+  async syncConfiguredFolders(onProgress?: (p: SyncProgress) => void, incremental = true): Promise<{ success: number; failed: number }> {
     const configured = parseSyncFolders(this.plugin.settings.syncFolders);
     const files = this.plugin.app.vault
       .getMarkdownFiles()
       .filter((file) => configured.length === 0 || configured.some((folder) => file.path === folder || file.path.startsWith(`${folder}/`)));
-    return this.syncFiles(files, onProgress);
+    return this.syncFiles(files, onProgress, incremental);
+  }
+
+  /**
+   * 全量同步：忽略增量逻辑，强制同步所有配置的文件
+   */
+  async syncConfiguredFoldersFull(onProgress?: (p: SyncProgress) => void): Promise<{ success: number; failed: number }> {
+    return this.syncConfiguredFolders(onProgress, false);
   }
 
   private cancelled = false;
@@ -56,10 +72,27 @@ export class SyncEngine {
     this.cancelled = true;
   }
 
-  async syncFiles(files: TFile[], onProgress?: (p: SyncProgress) => void): Promise<{ success: number; failed: number }> {
-    const deduped = Array.from(new Map(files.map((file) => [file.path, file])).values());
-    if (deduped.length === 0) {
-      new Notice("No markdown files matched the sync scope.");
+  async syncFiles(files: TFile[], onProgress?: (p: SyncProgress) => void, incremental = true): Promise<{ success: number; failed: number }> {
+    // 增量同步：只同步有变化的文件
+    let toSync: TFile[];
+    if (incremental) {
+      toSync = [];
+      for (const file of files) {
+        const lastMtime = this.plugin.mapping.fileMtimes[file.path];
+        if (!lastMtime || file.stat.mtime > lastMtime) {
+          toSync.push(file);
+        }
+      }
+      const skipped = files.length - toSync.length;
+      if (skipped > 0) {
+        console.log(`[obsidian-feishu] 增量同步: 跳过 ${skipped} 个未变化的文件`);
+      }
+    } else {
+      toSync = Array.from(new Map(files.map((file) => [file.path, file])).values());
+    }
+
+    if (toSync.length === 0) {
+      new Notice("没有需要同步的文件（全部未变化）");
       return { success: 0, failed: 0 };
     }
 
@@ -84,26 +117,28 @@ export class SyncEngine {
 
     try {
       this.cancelled = false;
-      this.plugin.setStatus(`Feishu Sync: 0/${deduped.length}`);
-      new Notice(`飞书同步开始 (${deduped.length} 个文件)`);
+      this.plugin.setStatus(`Feishu Sync: 0/${toSync.length}`);
+      new Notice(`飞书同步开始 (${toSync.length} 个文件${incremental ? '（增量）' : '（全量）'})`);
 
-      for (const [index, file] of deduped.entries()) {
+      for (const [index, file] of toSync.entries()) {
         if (this.cancelled) {
-          new Notice(`已取消同步 (${index}/${deduped.length})`, 4000);
+          new Notice(`已取消同步 (${index}/${toSync.length})`, 4000);
           break;
         }
-        this.plugin.setStatus(`Feishu Sync: ${index + 1}/${deduped.length} ✓${success} ✗${failed}`);
+        this.plugin.setStatus(`Feishu Sync: ${index + 1}/${toSync.length} ✓${success} ✗${failed}`);
         onProgress?.({
           current: index,
-          total: deduped.length,
+          total: toSync.length,
           currentFile: file.name,
           success,
           failed,
         });
         try {
-          await this.syncSingleFile(file, client);
+          // Wrap in timeout to prevent hanging - if any file takes >30s, skip it
+          await this.withTimeout(this.syncSingleFile(file, client), 30000);
           success += 1;
-          // 成功后从失败列表中移除（如果之前失败过）
+          // 成功后更新 mtime 并从失败列表中移除
+          this.plugin.mapping.fileMtimes[file.path] = file.stat.mtime;
           const prevFailedIdx = this.plugin.mapping.failedFiles.indexOf(file.path);
           if (prevFailedIdx > -1) {
             this.plugin.mapping.failedFiles.splice(prevFailedIdx, 1);
@@ -111,22 +146,23 @@ export class SyncEngine {
         } catch (error) {
           failed += 1;
           currentFailed.push(file.path);
-          console.error("[obsidian-feishu] sync failed", file.path, error);
-          new Notice(`失败: ${file.name} — ${error instanceof Error ? error.message : String(error)}`, 4000);
+          const msg = error instanceof Error ? error.message : String(error);
+          console.error("[obsidian-feishu] sync failed", file.path, msg);
+          new Notice(`失败: ${file.name} — ${msg.substring(0, 60)}`, 4000);
         }
 
-        // Yield to main thread after EVERY file to keep UI responsive
-        await new Promise<void>((r) => setTimeout(r, 0));
+        // Delay between files to avoid API rate limiting (150ms is safe for Feishu)
+        await new Promise<void>((r) => setTimeout(r, 150));
       }
 
       // 更新失败文件列表（合并历史和本次新增）
-      const allFailed = [...new Set([...this.plugin.mapping.failedFiles.filter(f => !deduped.some(d => d.path === f)), ...currentFailed])];
+      const allFailed = [...new Set([...this.plugin.mapping.failedFiles.filter(f => !toSync.some(d => d.path === f)), ...currentFailed])];
       this.plugin.mapping.failedFiles = allFailed;
       await this.saveDataFile();
 
       onProgress?.({
-        current: deduped.length,
-        total: deduped.length,
+        current: toSync.length,
+        total: toSync.length,
         currentFile: "",
         success,
         failed,
@@ -167,6 +203,18 @@ export class SyncEngine {
     return this.plugin.mapping.failedFiles;
   }
 
+  /**
+   * Timeout wrapper - ensures a promise resolves or rejects within specified milliseconds
+   */
+  private withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) => 
+        setTimeout(() => reject(new Error(`[Timeout] Operation exceeded ${ms}ms`)), ms)
+      )
+    ]);
+  }
+
   private async syncSingleFile(file: TFile, client: FeishuClient): Promise<void> {
     try {
       const markdown = await this.plugin.app.vault.cachedRead(file);
@@ -174,7 +222,7 @@ export class SyncEngine {
       const folderToken = await this.ensureTargetFolder(file, client);
 
       const existingDocumentId = this.plugin.mapping.files[file.path];
-      let documentId = existingDocumentId;
+      let documentId: string | undefined = existingDocumentId;
       let created = false;
 
       // 如果已有映射文档，尝试清空并更新；清空失败则尝试追加模式

@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "build": "tsc --project tsconfig.build.json --noEmit && node esbuild.config.mjs production",
     "test": "jest",
     "prebuild": "npm test",
     "test:e2e": "wdio run wdio.conf.ts",

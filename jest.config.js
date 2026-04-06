@@ -6,6 +6,7 @@ export default {
     '^obsidian$': '<rootDir>/tests/__mocks__/obsidian.ts',
   },
   testMatch: ['**/tests/**/*.test.ts'],
+  testPathIgnorePatterns: ['/node_modules/', '/tests/e2e/'],
   collectCoverageFrom: ['src/**/*.ts'],
   coverageDirectory: 'coverage',
 };
