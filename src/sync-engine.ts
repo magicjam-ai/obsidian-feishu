@@ -5,9 +5,11 @@ import { MarkdownParser, type ParsedBlock } from "./markdown-parser";
 import type { SyncProgress } from "./progress-modal";
 
 
+
 export interface SyncMappingData {
   files: Record<string, string>;
   folders: Record<string, string>;
+  failedFiles: string[]; // 同步失败的文件路径列表，支持增量重试
 }
 
 export class SyncEngine {
@@ -77,6 +79,9 @@ export class SyncEngine {
     }
     this.syncing = true;
 
+    // 记录本次失败的文件路径
+    const currentFailed: string[] = [];
+
     try {
       this.cancelled = false;
       this.plugin.setStatus(`Feishu Sync: 0/${deduped.length}`);
@@ -98,19 +103,27 @@ export class SyncEngine {
         try {
           await this.syncSingleFile(file, client);
           success += 1;
+          // 成功后从失败列表中移除（如果之前失败过）
+          const prevFailedIdx = this.plugin.mapping.failedFiles.indexOf(file.path);
+          if (prevFailedIdx > -1) {
+            this.plugin.mapping.failedFiles.splice(prevFailedIdx, 1);
+          }
         } catch (error) {
           failed += 1;
+          currentFailed.push(file.path);
           console.error("[obsidian-feishu] sync failed", file.path, error);
           new Notice(`失败: ${file.name} — ${error instanceof Error ? error.message : String(error)}`, 4000);
         }
 
-        // Yield to main thread every 5 files to keep UI responsive
-        if ((index + 1) % 5 === 0) {
-          await new Promise<void>((r) => setTimeout(r, 0));
-        }
+        // Yield to main thread after EVERY file to keep UI responsive
+        await new Promise<void>((r) => setTimeout(r, 0));
       }
 
+      // 更新失败文件列表（合并历史和本次新增）
+      const allFailed = [...new Set([...this.plugin.mapping.failedFiles.filter(f => !deduped.some(d => d.path === f)), ...currentFailed])];
+      this.plugin.mapping.failedFiles = allFailed;
       await this.saveDataFile();
+
       onProgress?.({
         current: deduped.length,
         total: deduped.length,
@@ -118,7 +131,9 @@ export class SyncEngine {
         success,
         failed,
       });
-      const summary = `飞书同步完成: ${success} 成功, ${failed} 失败`;
+      const summary = allFailed.length > 0
+        ? `飞书同步完成: ${success} 成功, ${failed} 失败 (共 ${allFailed.length} 个待重试)`
+        : `飞书同步完成: ${success} 成功, ${failed} 失败`;
       this.plugin.setStatus(summary);
       new Notice(summary, 6000);
       return { success, failed };
@@ -127,50 +142,101 @@ export class SyncEngine {
     }
   }
 
+  /**
+   * 重试之前失败的文件
+   */
+  async retryFailedFiles(): Promise<{ success: number; failed: number }> {
+    const failedPaths = this.plugin.mapping.failedFiles;
+    if (failedPaths.length === 0) {
+      new Notice("没有待重试的失败文件");
+      return { success: 0, failed: 0 };
+    }
+
+    const files = failedPaths
+      .map(path => this.plugin.app.vault.getAbstractFileByPath(path))
+      .filter((f): f is TFile => f instanceof TFile);
+
+    new Notice(`开始重试 ${files.length} 个失败文件...`);
+    return this.syncFiles(files);
+  }
+
+  /**
+   * 获取当前失败文件列表
+   */
+  getFailedFiles(): string[] {
+    return this.plugin.mapping.failedFiles;
+  }
+
   private async syncSingleFile(file: TFile, client: FeishuClient): Promise<void> {
-    const markdown = await this.plugin.app.vault.cachedRead(file);
-    const parsedBlocks = this.parser.parse(markdown);
-    const folderToken = await this.ensureTargetFolder(file, client);
-
-    const existingDocumentId = this.plugin.mapping.files[file.path];
-    let documentId = existingDocumentId;
-    let created = false;
-
-    if (documentId) {
-      try {
-        await client.clearDocument(documentId);
-      } catch (error) {
-        console.warn("[obsidian-feishu] clear existing document failed, recreating", documentId, error);
-        documentId = undefined;
-      }
-    }
-
-    if (!documentId) {
-      documentId = await client.createDocument(file.basename, folderToken);
-      this.plugin.mapping.files[file.path] = documentId;
-      created = true;
-      await this.saveDataFile();
-    }
-
-    const payload = await this.materializeBlocks(file, parsedBlocks, client);
-    await client.appendBlocks(documentId, documentId, payload);
-
-    if (created) {
-      try {
-        await client.transferOwner(documentId);
-      } catch (error) {
-        console.warn("[obsidian-feishu] transfer owner failed", documentId, error);
-      }
-    }
-
     try {
-      await client.setPermission(documentId);
-    } catch (error) {
-      console.warn("[obsidian-feishu] set permission failed", documentId, error);
-    }
+      const markdown = await this.plugin.app.vault.cachedRead(file);
+      const parsedBlocks = this.parser.parse(markdown);
+      const folderToken = await this.ensureTargetFolder(file, client);
 
-    // Add feishu link to frontmatter if not already present
-    await this.addFeishuLinkToFrontmatter(file, documentId);
+      const existingDocumentId = this.plugin.mapping.files[file.path];
+      let documentId = existingDocumentId;
+      let created = false;
+
+      // 如果已有映射文档，尝试清空并更新；清空失败则尝试追加模式
+      if (documentId) {
+        try {
+          await client.clearDocument(documentId);
+          created = false;
+        } catch (error) {
+          // 清空失败，可能是没有写权限或其他问题，标记需要重建
+          console.warn("[obsidian-feishu] clear document failed, will recreate:", documentId, error);
+          documentId = undefined;
+          created = false;
+        }
+      }
+
+      // 如果没有文档，创建新文档
+      if (!documentId) {
+        try {
+          documentId = await client.createDocument(file.basename, folderToken);
+          this.plugin.mapping.files[file.path] = documentId;
+          created = true;
+          await this.saveDataFile();
+        } catch (error) {
+          // 创建文档失败，抛出错误而不是静默跳过
+          throw new Error(`创建飞书文档失败: ${file.basename} - ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+
+      // 写入内容
+      try {
+        const payload = await this.materializeBlocks(file, parsedBlocks, client);
+        await client.appendBlocks(documentId, documentId, payload);
+      } catch (error) {
+        throw new Error(`写入内容失败: ${file.basename} - ${error instanceof Error ? error.message : String(error)}`);
+      }
+
+      // 新建文档才尝试转移 owner（旧文档已有多人权限，无需再转）
+      if (created) {
+        try {
+          await client.transferOwner(documentId);
+        } catch (error) {
+          // owner 转移失败不影响同步，用户已有编辑权限
+          console.warn("[obsidian-feishu] transfer owner failed (non-critical):", documentId, error);
+        }
+      }
+
+      // 设置文档权限（给用户 full_access）
+      try {
+        await client.setPermission(documentId);
+      } catch (error) {
+        // 权限设置失败可能是企业策略限制，不影响使用
+        console.warn("[obsidian-feishu] set permission failed (non-critical):", documentId, error);
+      }
+
+      // Add feishu link to frontmatter if not already present
+      await this.addFeishuLinkToFrontmatter(file, documentId);
+    } catch (error) {
+      // 统一捕获所有错误并重新抛出，确保错误信息清晰
+      const msg = error instanceof Error ? error.message : String(error);
+      console.error(`[obsidian-feishu] syncSingleFile failed for ${file.path}:`, error);
+      throw new Error(msg); // 保持原始错误信息不丢失
+    }
   }
 
   private async addFeishuLinkToFrontmatter(file: TFile, documentId: string): Promise<void> {

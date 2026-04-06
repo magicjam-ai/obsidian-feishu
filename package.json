@@ -6,12 +6,18 @@
   "type": "module",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "test": "jest",
+    "prebuild": "npm test"
   },
   "license": "MIT",
   "devDependencies": {
+    "@playwright/test": "^1.59.1",
+    "@types/jest": "^30.0.0",
     "@types/node": "^16.11.6",
     "esbuild": "0.25.5",
+    "jest": "^30.3.0",
+    "ts-jest": "^29.4.9",
     "tslib": "2.4.0",
     "typescript": "^5.8.3"
   },

@@ -9,7 +9,7 @@ interface PluginDataShape {
 
 export default class FeishuSyncPlugin extends Plugin {
   settings: FeishuSyncSettings = { ...DEFAULT_SETTINGS };
-  mapping: SyncMappingData = { files: {}, folders: {} };
+  mapping: SyncMappingData = { files: {}, folders: {}, failedFiles: [] };
   private statusBarEl!: HTMLElement;
   private syncEngine!: SyncEngine;
 
@@ -38,6 +38,19 @@ export default class FeishuSyncPlugin extends Plugin {
       id: "sync-current-folder",
       name: "Feishu: Sync current folder",
       callback: async () => this.runSync(() => this.syncEngine.syncCurrentFolder()),
+    });
+
+    this.addCommand({
+      id: "retry-failed-files",
+      name: "Feishu: Retry failed files",
+      callback: async () => {
+        const failed = this.syncEngine.getFailedFiles();
+        if (failed.length === 0) {
+          new Notice("没有待重试的失败文件");
+          return;
+        }
+        await this.runSync(() => this.syncEngine.retryFailedFiles());
+      },
     });
 
     this.addSettingTab(new FeishuSyncSettingTab(this.app, this));
@@ -72,6 +85,7 @@ export default class FeishuSyncPlugin extends Plugin {
     this.mapping = {
       files: { ...(data?.mappings?.files ?? {}) },
       folders: { ...(data?.mappings?.folders ?? {}) },
+      failedFiles: [...(data?.mappings?.failedFiles ?? [])],
     };
   }
 
