@@ -14,6 +14,7 @@ export interface FeishuSyncSettings {
   targetFolderToken: string;
   syncFolders: string;
   mirrorFolderStructure: boolean;
+  feishuDomain: string;
 
   // UI state
   useCustomApp: boolean;
@@ -28,6 +29,7 @@ export const DEFAULT_SETTINGS: FeishuSyncSettings = {
   syncFolders: "",
   mirrorFolderStructure: true,
   useCustomApp: false,
+  feishuDomain: "feishu.cn",
 };
 
 export class FeishuSyncSettingTab extends PluginSettingTab {
@@ -87,6 +89,19 @@ export class FeishuSyncSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.syncFolders)
           .onChange(async (value) => {
             this.plugin.settings.syncFolders = value;
+            await this.plugin.savePluginData();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("文档域名")
+      .setDesc("写入笔记 frontmatter 的飞书文档链接域名，例如 feishu.cn、larksuite.com，或企业自定义域名 xxx.feishu.cn。")
+      .addText((text) =>
+        text
+          .setPlaceholder("feishu.cn")
+          .setValue(this.plugin.settings.feishuDomain)
+          .onChange(async (value) => {
+            this.plugin.settings.feishuDomain = value.trim().replace(/^https?:\/\//, "").replace(/\/$/, "") || "feishu.cn";
             await this.plugin.savePluginData();
           }),
       );

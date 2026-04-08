@@ -204,6 +204,13 @@ export class FeishuClient {
     });
   }
 
+  async deleteDocument(documentId: string): Promise<void> {
+    // Move a docx file to trash. type=docx per Feishu Drive API.
+    await this.request("DELETE", `/drive/v1/files/${documentId}`, {
+      query: { type: "docx" },
+    });
+  }
+
   async createFolder(name: string, parentFolderToken: string): Promise<string> {
     const data = await this.request<{ token?: string }>("POST", "/drive/v1/files/create_folder", {
       body: { name, folder_token: parentFolderToken },
@@ -241,19 +248,15 @@ export class FeishuClient {
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
 
-        // On 401 in OAuth mode, try refreshing token and retry once
+        // On 401 in OAuth mode, force-retry once. The getAccessToken callback
+        // is responsible for refreshing the token; simply retrying the request
+        // will trigger it via doRequest → getAccessToken on the next pass.
         if (this.isOAuthMode && attempt === 0 && lastError.message.includes('401')) {
-          try {
-            if (this.config.getAccessToken) {
-              // The getAccessToken callback already handles refresh
-              // Just retry
-            }
-          } catch {
-            // Refresh failed, don't retry
-            break;
-          }
+          console.warn(`[FeishuClient] ${method} ${path} got 401, refreshing token and retrying once`);
+          await this.sleep(200);
+          continue;
         }
-        
+
         // Check if retryable
         if (attempt < maxRetries && this.isRetryable(lastError, attempt)) {
           const delay = Math.min(500 * Math.pow(2, attempt), 4000);

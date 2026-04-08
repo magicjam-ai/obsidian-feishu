@@ -153,7 +153,10 @@ export class SyncEngine {
           await this.withTimeout(this.syncSingleFile(file, client), 30000);
           success += 1;
           // 成功后更新 mtime 并从失败列表中移除
-          this.plugin.mapping.fileMtimes[file.path] = file.stat.mtime;
+          // 注意：addFeishuLinkToFrontmatter 可能刚刚修改了文件，需读取磁盘最新 mtime，
+          // 否则下次增量同步会把这个文件当作"已变化"再跑一遍
+          const latestMtime = await this.readLatestMtime(file);
+          this.plugin.mapping.fileMtimes[file.path] = latestMtime;
           const prevFailedIdx = this.plugin.mapping.failedFiles.indexOf(file.path);
           if (prevFailedIdx > -1) {
             this.plugin.mapping.failedFiles.splice(prevFailedIdx, 1);
@@ -218,6 +221,16 @@ export class SyncEngine {
     return this.plugin.mapping.failedFiles;
   }
 
+  private async readLatestMtime(file: TFile): Promise<number> {
+    try {
+      const stat = await this.plugin.app.vault.adapter.stat(file.path);
+      if (stat?.mtime) return stat.mtime;
+    } catch (error) {
+      console.warn("[obsidian-feishu] readLatestMtime failed, falling back to TFile.stat", file.path, error);
+    }
+    return file.stat.mtime;
+  }
+
   /**
    * Timeout wrapper - ensures a promise resolves or rejects within specified milliseconds
    */
@@ -246,8 +259,14 @@ export class SyncEngine {
           await client.clearDocument(documentId);
           created = false;
         } catch (error) {
-          // 清空失败，可能是没有写权限或其他问题，标记需要重建
+          // 清空失败，可能是没有写权限或文档已被删除。尽力删掉旧文档避免孤儿堆积，
+          // 然后走重建分支。删除失败也无所谓——旧文档可能本来就不存在了。
           console.warn("[obsidian-feishu] clear document failed, will recreate:", documentId, error);
+          try {
+            await client.deleteDocument(documentId);
+          } catch (delErr) {
+            console.warn("[obsidian-feishu] best-effort delete of orphan doc failed:", documentId, delErr);
+          }
           documentId = undefined;
           created = false;
         }
@@ -310,7 +329,8 @@ export class SyncEngine {
       if (fmMatch && fmMatch[1] && /^feishu:/m.test(fmMatch[1])) {
         return;
       }
-      const url = `https://nio.feishu.cn/docx/${documentId}`;
+      const domain = (this.plugin.settings.feishuDomain || "feishu.cn").replace(/^https?:\/\//, "").replace(/\/$/, "");
+      const url = `https://${domain}/docx/${documentId}`;
       await this.plugin.app.fileManager.processFrontMatter(file, (fm) => {
         if (!fm.feishu) {
           fm.feishu = url;
@@ -358,6 +378,7 @@ export class SyncEngine {
     const segments = folderPath.split("/").filter(Boolean);
     let currentPath = "";
     let currentToken = this.plugin.settings.targetFolderToken;
+    let dirty = false;
 
     for (const segment of segments) {
       currentPath = currentPath ? `${currentPath}/${segment}` : segment;
@@ -375,9 +396,12 @@ export class SyncEngine {
         currentToken = await client.createFolder(segment, currentToken);
       }
       this.plugin.mapping.folders[currentPath] = currentToken;
-      await this.saveDataFile();
+      dirty = true;
     }
 
+    if (dirty) {
+      await this.saveDataFile();
+    }
     return currentToken;
   }
 }
